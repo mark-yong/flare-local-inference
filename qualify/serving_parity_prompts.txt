@@ -1,0 +1,40 @@
+The capital of France is
+The largest ocean on Earth is
+The chemical symbol for gold is
+The speed of light in vacuum is approximately
+The first President of the United States was
+The powerhouse of the cell is the
+Water boils at standard pressure at a temperature of
+The largest planet in the solar system is
+The author of Romeo and Juliet is
+The currency of Japan is the
+2 + 2 equals
+17 * 23 equals
+The square root of 144 is
+15 percent of 200 is
+If a train travels 60 kilometers per hour for 2 hours, it covers
+7 factorial equals
+The sum of the first ten positive integers is
+1024 divided by 8 equals
+All humans are mortal. Socrates is a human. Therefore, Socrates is
+The odd one out among apple, banana, carrot, cherry is
+Ice floats on water because it is
+A word meaning the opposite of "ancient" is
+If today is Wednesday, the day after tomorrow is
+The plural of "child" is
+An animal that says moo is a
+The season after summer is
+Once upon a time, in a kingdom far away,
+The recipe for pancakes begins by mixing flour, eggs, and
+In machine learning, overfitting occurs when a model
+Dear Sir or Madam, I am writing to
+The lecture on thermodynamics opened with the statement that
+To bake bread, you first need to
+The history of the printing press began when
+A good night's sleep is important because
+In Python, the function to read a file line by line is
+The SQL clause used to filter rows is
+A Python list comprehension for squares of the first five integers is [x*x for x in
+In Git, the command to create a new branch is
+The time complexity of binary search is
+In JavaScript, the keyword to declare a block-scoped variable is
