@@ -226,3 +226,60 @@ def test_ggml_projection_and_expert_declarations(algo, group, payload):
                          ("packing", "row"), ("weight_scale_encoding", "csf")):
         with pytest.raises(ValueError, match="block encoding"):
             linear_format({"proj": entry | {field: wrong}}, "proj")
+
+
+def test_nvfp4_ungated_relu2_experts_load_up_and_down_only(monkeypatch):
+    import torch
+    import b12x._lib.intrinsics.reference as reference
+    from b12x.moe import fused_moe as moe
+
+    loader = DirectWeightLoader(SimpleNamespace(), "cpu")
+    loader._session = SimpleNamespace(flush=lambda: None)
+    prefixes = ("expert0", "expert1")
+    hidden, intermediate, group = 128, 64, 16
+    for expert, prefix in enumerate(prefixes):
+        for projection in ("up_proj", "down_proj"):
+            rows, columns = ((hidden, intermediate) if projection == "down_proj"
+                             else (intermediate, hidden))
+            loader._sources[f"{prefix}.{projection}.weight"] = (
+                torch.arange(rows * (columns // 2)).reshape(rows, columns // 2) + 7 * expert).to(torch.uint8)
+            loader._sources[f"{prefix}.{projection}.weight_scale"] = torch.full(
+                (rows, columns // group), 2 + expert, dtype=torch.float8_e4m3fn)
+            loader._sources[f"{prefix}.{projection}.weight_scale_2"] = torch.tensor(
+                0.5 + expert if projection == "up_proj" else 2.0 + expert)
+    monkeypatch.setattr(loader, "_copy", lambda destination, source: destination.copy_(source))
+    monkeypatch.setattr(moe, "plan_weights", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(moe, "prepare_weights", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(reference, "swizzle_block_scale", lambda scales: scales)
+    prepared = loader.load_fp4_experts(prefixes, hidden_size=hidden, intermediate_size=intermediate,
+                                       format="nvfp4", activation_mode="a16", activation="relu2")
+    assert prepared.plan.activation.nonlinearity == "relu2"
+    assert prepared.plan.activation.swiglu_limit is None
+    assert prepared.plan.geometry.intermediate_size == intermediate
+    for index, prefix in enumerate(prefixes):
+        up = loader._sources[f"{prefix}.up_proj.weight"]
+        down = loader._sources[f"{prefix}.down_proj.weight"]
+        assert prepared.weights.w13[index].shape == (intermediate, hidden // 2)
+        assert torch.equal(prepared.weights.w13[index], up)
+        assert torch.equal(prepared.weights.w2[index], down)
+        assert torch.equal(prepared.weights.w13_block_scales[index],
+                           loader._sources[f"{prefix}.up_proj.weight_scale"])
+        assert torch.equal(prepared.weights.w2_block_scales[index],
+                           loader._sources[f"{prefix}.down_proj.weight_scale"])
+    assert prepared.weights.w13_global_scales.tolist() == [0.5, 1.5]
+    assert prepared.weights.w2_global_scales.tolist() == [2.0, 3.0]
+    options = dict(hidden_size=hidden, intermediate_size=intermediate, format="nvfp4",
+                   activation_mode="a16", activation="relu2")
+    for override in (dict(format="mxfp4"), dict(scale_compression="csf"), dict(swiglu_limit=7.),
+                     dict(projection_names=("w1", "w3", "w2"))):
+        with pytest.raises(ValueError, match="ungated relu2"):
+            loader.load_fp4_experts(prefixes, **{**options, **override})
+
+
+def test_nvfp4_ungated_relu2_experts_are_rejected_on_sm103(monkeypatch):
+    loader = DirectWeightLoader(SimpleNamespace(), "cpu")
+    loader._session = SimpleNamespace(flush=lambda: None)
+    monkeypatch.setattr("ignition.components.sm103.is_sm103", lambda device: True)
+    with pytest.raises(ValueError, match="SM103"):
+        loader.load_fp4_experts(("expert",), hidden_size=128, intermediate_size=64,
+                                format="nvfp4", activation_mode="a16", activation="relu2")

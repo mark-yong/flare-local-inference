@@ -722,7 +722,9 @@ class DirectWeightLoader:
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
 
         The first two projection names fill the first and second w13 halves in that
-        order; ``w13_layout`` declares which halves hold up and gate. CSF compression
+        order; ``w13_layout`` declares which halves hold up and gate. Ungated
+        ``activation="relu2"`` experts load the up and down projections only, with
+        ``w13`` holding the up projection. CSF compression
         requires two caller-owned expansion buffers. Serial routed layers may share
         those buffers; overlapping calls must not. With ``shared_columns``, each
         expert's down projection, whose intermediate columns partition across ranks,
@@ -739,6 +741,14 @@ class DirectWeightLoader:
         sm103 = is_sm103(self.device)
         if sm103 and (scale_compression is not None or scale_scratch is not None):
             raise ValueError("SM103 FP4 experts do not support load-time scale compression")
+        ungated = activation == "relu2"
+        if ungated and (format != "nvfp4" or scale_compression is not None
+                        or swiglu_limit is not None or swiglu_clamp_after_silu
+                        or projection_names != ("up_proj", "gate_proj", "down_proj")):
+            raise ValueError("ungated relu2 experts require uncompressed NVFP4 up/down projections")
+        if ungated and sm103:
+            raise ValueError("ungated relu2 experts have no SM103 preparation path;"
+                             " SM103 FP4 kernels prepare gated SwiGLU experts")
         up_name, gate_name, down_name = projection_names
         if format not in ("nvfp4", "mxfp4"):
             raise ValueError("ordinary FP4 experts require NVFP4 or MXFP4")
@@ -746,9 +756,10 @@ class DirectWeightLoader:
         scale_dtype = torch.float8_e4m3fn if format == "nvfp4" else torch.uint8
         first, last = _aligned_range(intermediate_range, intermediate_size, group)
         local, count = last - first, len(prefixes)
-        w13 = torch.empty((count, 2 * local, hidden_size // 2), dtype=torch.uint8, device=self.device)
+        halves = 1 if ungated else 2
+        w13 = torch.empty((count, halves * local, hidden_size // 2), dtype=torch.uint8, device=self.device)
         w2 = torch.empty((count, hidden_size, local // 2), dtype=torch.uint8, device=self.device)
-        s13 = torch.empty((count, 2 * local, hidden_size // group), dtype=scale_dtype, device=self.device)
+        s13 = torch.empty((count, halves * local, hidden_size // group), dtype=scale_dtype, device=self.device)
         s2 = torch.empty((count, hidden_size, local // group), dtype=scale_dtype, device=self.device)
         globals13, globals2 = [], []
         shared = shared_columns
@@ -759,11 +770,10 @@ class DirectWeightLoader:
                 raise ValueError("shared column staging cannot hold this rank's down projections")
         for index, prefix in enumerate(prefixes):
             scales = {}
-            for projection, values, blocks in (
-                (up_name, w13[index, :local], s13[index, :local]),
-                (gate_name, w13[index, local:], s13[index, local:]),
-                (down_name, w2[index], s2[index]),
-            ):
+            slots = (((up_name, w13[index, :local], s13[index, :local]),
+                      (gate_name, w13[index, local:], s13[index, local:]))
+                     if not ungated else ((up_name, w13[index], s13[index]),))
+            for projection, values, blocks in (*slots, (down_name, w2[index], s2[index])):
                 source = self._sources[f"{prefix}.{projection}.{weight_name}"]
                 scale = self._sources[f"{prefix}.{projection}.{scale_name}"]
                 if format == "mxfp4":
@@ -797,7 +807,7 @@ class DirectWeightLoader:
                 scales[projection] = value.item()
             if format == "mxfp4":
                 continue
-            if scales[gate_name] != scales[up_name]:
+            if not ungated and scales[gate_name] != scales[up_name]:
                 raise ValueError(f"{prefix}: gate/up global scales differ")
             globals13.append(scales[up_name])
             globals2.append(scales[down_name])
