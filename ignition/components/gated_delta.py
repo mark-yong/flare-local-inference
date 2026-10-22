@@ -11,8 +11,7 @@ from b12x.preparation import PreparationSession
 from b12x.sequence import gdn_decode, gdn_prefill, short_conv
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
-from ignition.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
+from ignition.components.linear import QuantizedProjection, prepare_projection
 from ignition.components.recurrent import (
     DeltaMetadata,
     DeltaState,
@@ -245,14 +244,8 @@ class PreparedGDN:
             raise ValueError("GDN requires QKV/Z, packed B/A, and output projection weights")
 
         def projection(key, inputs, output):
-            weight = projections[key]
-            options = dict(session=session, name=f"{name}.{key}")
-            if isinstance(weight, TensorFP8Weight):
-                return TensorFP8Projection(inputs, weight, output, **options)
-            if isinstance(weight, torch.Tensor):
-                return UnquantizedProjection(inputs, weight, output, **options)
-            return QuantizedProjection(inputs, weight, output, activation_mode="auto",
-                                       workspace=projection_workspace, **options)
+            return prepare_projection(inputs, projections[key], output,
+                session=session, name=f"{name}.{key}", workspace=projection_workspace)
 
         if prepare_projections:
             inputs = (("in_proj_qkvz", scratch.projected_qkvz),) if self.fused_qkvz else (

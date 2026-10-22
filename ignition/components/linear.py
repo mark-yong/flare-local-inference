@@ -21,6 +21,7 @@ from ignition.preparation.tuning import declare, register_finalizer
 def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
     """Bind a projection without changing its checkpoint weight representation."""
     from .block_fp8 import BlockFP8Projection, BlockFP8Weight
+    from .tensor_fp8 import TensorFP8Projection, TensorFP8Weight
     from .weights import GroupedLinearWeights
 
     if isinstance(weight, GroupedLinearWeights):
@@ -30,6 +31,8 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
         return UnquantizedProjection(source, weight, output, session=session, name=name)
     if isinstance(weight, BlockFP8Weight):
         return BlockFP8Projection(source, weight, output, session=session, name=name)
+    if isinstance(weight, TensorFP8Weight):
+        return TensorFP8Projection(source, weight, output, session=session, name=name)
     return QuantizedProjection(source, weight, output, session=session, name=name,
                                workspace=workspace, activation_mode=activation_mode)
 
