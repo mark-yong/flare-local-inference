@@ -192,6 +192,29 @@ The 64-row speculative capacity covers eight requests with seven draft tokens ea
 For concurrency 32 with seven draft tokens per request, use
 `--max-concurrency 32 --speculative-token-capacity 256`.
 
+## Nemotron 3.5 Lightning 30B-A3B
+
+`nemotron-lightning-30b` prepares
+`nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4` for text generation on one
+SM120/SM121 GPU. It is the text-only `NemotronHForCausalLM` sibling of the Bolt
+recipe: BF16 attention projections run without positional embeddings, Mamba
+input and output projections are tensor-scaled FP8, and the routed experts are
+ungated ReLU-squared NVFP4 with a full-width BF16 shared expert. Continuation
+rows retain BF16 recurrent state, convolution history, and partial FP8 KV
+pages. The checkpoint's in-checkpoint MTP module is not prepared; the recipe
+has no vision encoder, draft model, or speculation. Prepare on the same GPU
+architecture as the serving device:
+
+```sh
+.venv/bin/python -m ignition export nemotron-lightning-30b --gpus 0 \
+  --max-concurrency 4 --prefill-chunk-size 4096 \
+  --output /data/flare-runtime/nemotron-lightning-30b-c4.safetensors --verbose
+
+./flare/target/release/flare run \
+  /data/flare-runtime/nemotron-lightning-30b-c4.safetensors \
+  --gpus 0 --bind 127.0.0.1:8001
+```
+
 ## Qwen3.8 27B
 
 `qwen3.8-27b` prepares `nvidia/Qwen3.8-27B-NVFP4` for text generation on one GPU.
