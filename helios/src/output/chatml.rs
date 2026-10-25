@@ -20,10 +20,16 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
     }
     fn starts_call(text: &str) -> Option<bool> {
         // Calls continue with `<function=NAME>` and a parameter or closing tag; quoted
-        // or inline tags followed by prose remain text.
+        // or inline tags followed by prose remain text. A parameter directly after the
+        // opener is a call missing its header, which must still fail.
         let text = text.strip_prefix(Self::OPEN).map_or(text, str::trim_start);
         let Some(header) = text.strip_prefix("<function=") else {
-            return if "<function=".starts_with(text) {
+            return if text.starts_with("<parameter=") {
+                Some(true)
+            } else if ["<function=", "<parameter="]
+                .iter()
+                .any(|next| next.starts_with(text))
+            {
                 None
             } else {
                 Some(false)
@@ -570,6 +576,35 @@ mod tests {
                     message["tool_calls"].as_array().map_or(0, Vec::len),
                     calls,
                     "{text:?} at {split}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn calls_missing_the_function_header_still_fail() {
+        let call = "<tool_call>\n<parameter=city>\nParis\n</parameter>\n</tool_call>";
+        for (start, text) in [
+            (
+                crate::output::tagged::OutputStart::Content,
+                format!("Checking.\n\n{call}"),
+            ),
+            (
+                crate::output::tagged::OutputStart::Reasoning,
+                format!("Need the weather.\n{call}"),
+            ),
+        ] {
+            for split in text.char_indices().map(|(at, _)| at) {
+                let mut parser = Harness::new(OutputConfig { start, ..config() }, "x".into());
+                let result = parser
+                    .push(&text[..split])
+                    .and_then(|_| parser.push(&text[split..]))
+                    .and_then(|_| parser.finish());
+                let error = result.expect_err(&format!("{text:?} at {split}"));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("tool call requires a function tag"),
+                    "{text:?} at {split}: {error}"
                 );
             }
         }
