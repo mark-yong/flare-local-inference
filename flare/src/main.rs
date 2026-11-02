@@ -53,10 +53,48 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+/// A non-interactive shell backgrounding a command ignores SIGINT and
+/// SIGQUIT for the child, and a wrapper's `trap ''` dispositions survive
+/// `execve`, so a scripted or fleet-launched flare can begin with SIGINT
+/// (or even SIGTERM) ignored and end only to `SIGKILL`. Reset signals that
+/// were ignored on entry to their default disposition so an explicitly
+/// delivered cancellation works; a disposition installed as a real handler
+/// is deliberate and stays in place. SIGQUIT is not restored: its default
+/// action (terminate with core dump) is a different operational behaviour
+/// than cancellation, and `nohup`'s deliberate SIGHUP ignore is likewise
+/// left alone. This changes only what happens when a signal is delivered —
+/// terminal process-group routing is unchanged — and default termination
+/// during loading is termination, not a graceful cancel. The serving path
+/// installs its own graceful handlers once the server is up, so restoring
+/// before startup begins is safe.
+#[cfg(unix)]
+fn restore_inherited_signals() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        // Query without mutating: installing SIG_IGN to read the previous
+        // disposition would open a window where a delivered signal is
+        // silently dropped.
+        // SAFETY: a null `act` makes `sigaction` a pure query, and
+        // `&mut current` is a valid out-pointer.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) } != 0 {
+            continue;
+        }
+        // On Linux `sa_sigaction` aliases the handler slot; a non-SA_SIGINFO
+        // disposition is SIG_DFL/SIG_IGN encoded there.
+        if current.sa_sigaction as *const () as usize == libc::SIG_IGN {
+            // SAFETY: restoring the default disposition of a standard
+            // signal; nothing has installed our handlers this early.
+            unsafe { libc::signal(signal, libc::SIG_DFL) };
+        }
+    }
+}
+
 #[cfg(all(feature = "roce", not(target_os = "linux")))]
 compile_error!("the roce feature requires Linux");
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    restore_inherited_signals();
     let matches = cli::Cli::command().get_matches();
     let mut parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     let home = environment::home_directory()?;
@@ -656,6 +694,173 @@ mod tests {
     use clap::Parser as _;
     use flare_helios::package::cache::{PackageSource, Root, model_key};
     use flare_helios::package::reader;
+
+    /// Query a signal's disposition without altering it.
+    #[cfg(unix)]
+    fn disposition(signal: libc::c_int) -> usize {
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null `act` makes `sigaction` a pure query.
+        unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+        current.sa_sigaction as usize
+    }
+
+    #[cfg(unix)]
+    extern "C" fn record_signal(_: libc::c_int) {}
+
+    /// Child shared by the restore subprocess tests: launched through a
+    /// shell that ignores SIGINT and SIGTERM, verifies the entry
+    /// dispositions really are ignored, and restores them. Only reached
+    /// when invoked by name with `--include-ignored`.
+    #[cfg(unix)]
+    fn child_restore_body() -> bool {
+        disposition(libc::SIGINT) == libc::SIG_IGN
+            && disposition(libc::SIGTERM) == libc::SIG_IGN
+            && {
+                super::restore_inherited_signals();
+                disposition(libc::SIGINT) == libc::SIG_DFL
+                    && disposition(libc::SIGTERM) == libc::SIG_DFL
+            }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn child_restores_inherited_ignored_signals_and_exits() {
+        assert!(child_restore_body());
+        println!("restored");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn child_restores_inherited_ignored_signals_and_waits() {
+        assert!(child_restore_body());
+        println!("restored");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// Child half of the handler-preservation test: with SIGINT ignored on
+    /// entry and a real handler installed before the restore, the handler
+    /// must survive. The harness exits 0 on success.
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn child_keeps_installed_handlers() {
+        assert_eq!(disposition(libc::SIGINT), libc::SIG_IGN);
+        // SAFETY: installing our own handler in our own test process.
+        unsafe { libc::signal(libc::SIGINT, record_signal as *const () as libc::sighandler_t) };
+        super::restore_inherited_signals();
+        assert_eq!(
+            disposition(libc::SIGINT),
+            record_signal as *const () as usize
+        );
+        println!("handler-preserved");
+    }
+
+    /// Spawns this test binary through `sh` with the listed signals
+    /// ignored, running one helper test by name.
+    #[cfg(unix)]
+    fn run_signal_child(signals_to_ignore: &str, test_name: &str) -> std::process::Output {
+        let exe = std::env::current_exe().unwrap();
+        let script = format!(r#"trap "" {signals_to_ignore}; exec "$@""#);
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("flare-signal-child")
+            .arg(&exe)
+            .arg(test_name)
+            .arg("--include-ignored")
+            .arg("--nocapture")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_ignored_signals_are_restored() {
+        // A non-interactive shell backgrounding a job ignores SIGINT and
+        // SIGQUIT; the explicit `trap` adds SIGTERM the way a wrapper
+        // would. The child asserts the ignored entry dispositions, runs the
+        // restore, and exits cleanly only if both signals ended up default.
+        let output = run_signal_child("int term", "child_restores_inherited_ignored_signals_and_exits");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("restored"),
+            "child failed to restore inherited ignores: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_sigint_terminates_the_process() {
+        // End-to-end half: after the restore, an explicitly delivered
+        // SIGINT must terminate the child through the default action.
+        use std::io::BufRead;
+        use std::os::unix::process::ExitStatusExt;
+        let exe = std::env::current_exe().unwrap();
+        let script = r#"trap "" int term; exec "$@""#.to_string();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("flare-signal-child")
+            .arg(&exe)
+            .arg("child_restores_inherited_ignored_signals_and_waits")
+            .arg("--include-ignored")
+            .arg("--nocapture")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let mut ready = false;
+        while let Some(line) = lines.next().transpose().unwrap() {
+            if line == "restored" {
+                ready = true;
+                break;
+            }
+        }
+        assert!(ready, "child never reported the restore");
+        drop(lines);
+        // SAFETY: signalling our own child.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait().unwrap() {
+                Some(status) => {
+                    assert_eq!(
+                        status.signal(),
+                        Some(libc::SIGINT),
+                        "SIGINT must terminate the restored process by \
+                         default, not be ignored or exit cleanly"
+                    );
+                    return;
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child survived SIGINT: disposition still ignored");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_keeps_installed_handlers() {
+        let output = run_signal_child("int term", "child_keeps_installed_handlers");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("handler-preserved"),
+            "restore replaced an installed handler: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn run_args(
         package: &Path,
